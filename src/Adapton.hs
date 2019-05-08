@@ -1,53 +1,58 @@
-{-# language GADTs, RecursiveDo #-}
+{-# language GADTs, RecursiveDo, ScopedTypeVariables, RankNTypes #-}
 module Adapton where
 
 import Control.Concurrent.Supply (Supply, freshId)
 import Control.Monad (when)
-import Control.Monad.ST (ST)
 import Data.Set (Set)
 import Data.Foldable (traverse_)
 import Data.Functor.Classes (Eq1(..), Ord1(..))
-import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef, modifySTRef)
+import Data.Hashable (Hashable, hash)
+import Data.HashTable.IO (BasicHashTable)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef)
 
+import GHC.Exts (Any)
+import Unsafe.Coerce (unsafeCoerce)
+
+import qualified Data.HashTable.IO as HashTable
 import qualified Data.Set as Set
 
-data SomeAdapton s where
-  SomeAdapton :: Adapton s a -> SomeAdapton s
-instance Eq (SomeAdapton s) where
+data SomeAdapton where
+  SomeAdapton :: Adapton a -> SomeAdapton
+instance Eq SomeAdapton where
   SomeAdapton a == SomeAdapton b = liftEq undefined a b
-instance Ord (SomeAdapton s) where
+instance Ord SomeAdapton where
   compare (SomeAdapton a) (SomeAdapton b) = liftCompare undefined a b
 
-data Adapton s a
+data Adapton a
   = Adapton
   { _id :: Int
-  , _thunk :: ST s a
-  , _result :: STRef s a
-  , _sub :: STRef s (Set (SomeAdapton s))
-  , _super :: STRef s (Set (SomeAdapton s))
-  , _clean :: STRef s Bool
+  , _thunk :: IO a
+  , _result :: IORef a
+  , _sub :: IORef (Set SomeAdapton)
+  , _super :: IORef (Set SomeAdapton)
+  , _clean :: IORef Bool
   }
 
-instance Eq (Adapton s a) where; a == b = _id a == _id b
-instance Eq1 (Adapton s) where; liftEq _ a b = _id a == _id b
-instance Ord (Adapton s a) where
+instance Eq (Adapton a) where; a == b = _id a == _id b
+instance Eq1 Adapton where; liftEq _ a b = _id a == _id b
+instance Ord (Adapton a) where
   compare a b = compare (_id a) (_id b)
-instance Ord1 (Adapton s) where
+instance Ord1 Adapton where
   liftCompare _ a b = compare (_id a) (_id b)
 
-fresh :: STRef s Supply -> ST s Int
+fresh :: IORef Supply -> IO Int
 fresh ref = do
-  a <- readSTRef ref
+  a <- readIORef ref
   let (n, a') = freshId a
-  n <$ writeSTRef ref a'
+  n <$ writeIORef ref a'
 
-mkAdapton :: STRef s Supply -> ST s a -> ST s (Adapton s a)
+mkAdapton :: IORef Supply -> IO a -> IO (Adapton a)
 mkAdapton supplyRef a = do
   n <- fresh supplyRef
-  resultRef <- newSTRef undefined
-  subRef <- newSTRef mempty
-  superRef <- newSTRef mempty
-  cleanRef <- newSTRef False
+  resultRef <- newIORef undefined
+  subRef <- newIORef mempty
+  superRef <- newIORef mempty
+  cleanRef <- newIORef False
   pure $
     Adapton
     { _id = n
@@ -58,48 +63,48 @@ mkAdapton supplyRef a = do
     , _clean = cleanRef
     }
 
-addDcgEdge :: Adapton s a -> Adapton s b -> ST s ()
+addDcgEdge :: Adapton a -> Adapton b -> IO ()
 addDcgEdge super sub = do
-  modifySTRef (_sub super) $ Set.insert (SomeAdapton sub)
-  modifySTRef (_super sub) $ Set.insert (SomeAdapton super)
+  modifyIORef (_sub super) $ Set.insert (SomeAdapton sub)
+  modifyIORef (_super sub) $ Set.insert (SomeAdapton super)
 
-delDcgEdge :: Adapton s a -> Adapton s b -> ST s ()
+delDcgEdge :: Adapton a -> Adapton b -> IO ()
 delDcgEdge super sub = do
-  modifySTRef (_sub super) $ Set.delete (SomeAdapton sub)
-  modifySTRef (_super sub) $ Set.delete (SomeAdapton super)
+  modifyIORef (_sub super) $ Set.delete (SomeAdapton sub)
+  modifyIORef (_super sub) $ Set.delete (SomeAdapton super)
 
-compute :: Adapton s a -> ST s a
+compute :: Adapton a -> IO a
 compute a = do
-  b <- readSTRef (_clean a)
+  b <- readIORef (_clean a)
   if b
-    then readSTRef (_result a)
+    then readIORef (_result a)
     else do
-      traverse_ (\(SomeAdapton b) -> delDcgEdge a b) =<< readSTRef (_sub a)
-      writeSTRef (_clean a) True
-      writeSTRef (_result a) =<< _thunk a
+      traverse_ (\(SomeAdapton b) -> delDcgEdge a b) =<< readIORef (_sub a)
+      writeIORef (_clean a) True
+      writeIORef (_result a) =<< _thunk a
       compute a
 
-dirty :: Adapton s a -> ST s ()
+dirty :: Adapton a -> IO ()
 dirty a = do
-  b <- readSTRef $ _clean a
+  b <- readIORef $ _clean a
   when b $ do
-    writeSTRef (_clean a) False
-    traverse_ (\(SomeAdapton x) -> dirty x) =<< readSTRef (_super a)
+    writeIORef (_clean a) False
+    traverse_ (\(SomeAdapton x) -> dirty x) =<< readIORef (_super a)
 
-newtype Ref s a = Ref { unRef :: Adapton s a }
+newtype Ref a = Ref { unRef :: Adapton a }
 
-ref :: STRef s Supply -> a -> ST s (Ref s a)
+ref :: IORef Supply -> a -> IO (Ref a)
 ref supplyRef val = do
   n <- fresh supplyRef
-  resultRef <- newSTRef val
-  subRef <- newSTRef mempty
-  superRef <- newSTRef mempty
-  cleanRef <- newSTRef True
+  resultRef <- newIORef val
+  subRef <- newIORef mempty
+  superRef <- newIORef mempty
+  cleanRef <- newIORef True
   let
     a =
       Adapton
       { _id = n
-      , _thunk = readSTRef resultRef
+      , _thunk = readIORef resultRef
       , _result = resultRef
       , _sub = subRef
       , _super = superRef
@@ -107,15 +112,59 @@ ref supplyRef val = do
       }
   pure $ Ref a
 
-setRef :: Ref s a -> a -> ST s ()
+setRef :: Ref a -> a -> IO ()
 setRef (Ref a) val = do
-  writeSTRef (_result a) val
+  writeIORef (_result a) val
   dirty a
 
-force :: STRef s (Maybe (SomeAdapton s)) -> Adapton s a -> ST s a
+force :: IORef (Maybe SomeAdapton) -> Adapton a -> IO a
 force current a = do
-  prev <- readSTRef current
-  writeSTRef current $ Just (SomeAdapton a)
+  prev <- readIORef current
+  writeIORef current $ Just (SomeAdapton a)
   result <- compute a
-  writeSTRef current prev
+  writeIORef current prev
   result <$ traverse_ (\(SomeAdapton x) -> addDcgEdge x a) prev
+
+memoizeL ::
+  forall a b.
+  Hashable a =>
+  BasicHashTable Int Any ->
+  IORef Supply ->
+  (a -> IO b) ->
+  a -> IO (Adapton b)
+memoizeL table s f x = do
+  let h = hash x
+  res <- HashTable.lookup table h
+  case res of
+    Nothing -> do
+      a :: Adapton b <- mkAdapton s (f x)
+      a <$ HashTable.insert table h (unsafeCoerce a :: Any)
+    Just a -> pure (unsafeCoerce a :: Adapton b)
+
+memoize ::
+  forall s a b.
+  Hashable a =>
+  BasicHashTable Int Any ->
+  IORef Supply ->
+  IORef (Maybe SomeAdapton) ->
+  (a -> IO b) ->
+  a -> IO b
+memoize table s cur f x = force cur =<< memoizeL table s f x
+
+newtype AVar s a = AVar { unAVar :: Ref (Adapton a) }
+
+avar :: IORef Supply -> IO a -> IO (AVar s a)
+avar sup a = fmap AVar . ref sup =<< mkAdapton sup a
+
+avarGet :: IORef (Maybe SomeAdapton) -> AVar s a -> IO a
+avarGet cur (AVar (Ref a)) = force cur =<< force cur a
+
+avarSet :: IORef Supply -> AVar s a -> IO a -> IO ()
+avarSet sup (AVar v) a = setRef v =<< mkAdapton sup a
+
+setup :: Supply -> IO (IORef Supply, IORef (Maybe SomeAdapton), BasicHashTable Int Any)
+setup sup = do
+  supRef <- newIORef sup
+  ht <- HashTable.new
+  curRef <- newIORef Nothing
+  pure (supRef, curRef, ht)
