@@ -125,14 +125,14 @@ force current a = do
   writeIORef current prev
   result <$ traverse_ (\(SomeAdapton x) -> addDcgEdge x a) prev
 
-memoizeL ::
+memoizeLM ::
   forall a b.
   Hashable a =>
   BasicHashTable Int Any ->
   IORef Supply ->
   (a -> IO b) ->
   a -> IO (Adapton b)
-memoizeL table s f x = do
+memoizeLM table s f x = do
   let h = hash x
   res <- HashTable.lookup table h
   case res of
@@ -141,7 +141,17 @@ memoizeL table s f x = do
       a <$ HashTable.insert table h (unsafeCoerce a :: Any)
     Just a -> pure (unsafeCoerce a :: Adapton b)
 
-memoize ::
+mapAdapton ::
+  Hashable a =>
+  BasicHashTable Int Any ->
+  IORef Supply ->
+  IORef (Maybe SomeAdapton) ->
+  (a -> IO b) ->
+  Adapton a ->
+  IO (Adapton b)
+mapAdapton ht sup cur f a = force cur a >>= memoizeLM ht sup f
+
+memoizeM ::
   forall s a b.
   Hashable a =>
   BasicHashTable Int Any ->
@@ -149,7 +159,7 @@ memoize ::
   IORef (Maybe SomeAdapton) ->
   (a -> IO b) ->
   a -> IO b
-memoize table s cur f x = force cur =<< memoizeL table s f x
+memoizeM table s cur f x = force cur =<< memoizeLM table s f x
 
 newtype AVar s a = AVar { unAVar :: Ref (Adapton a) }
 
