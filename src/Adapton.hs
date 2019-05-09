@@ -1,6 +1,5 @@
 {-# language GADTs, ScopedTypeVariables, RankNTypes #-}
 {-# language GeneralizedNewtypeDeriving #-}
-{-# language RecursiveDo #-}
 {-# language DataKinds, PolyKinds, UnboxedTuples, UndecidableInstances #-}
 {-# language TypeApplications #-}
 module Adapton where
@@ -8,9 +7,10 @@ module Adapton where
 import Control.Concurrent.Supply (Supply, newSupply, freshId)
 import Control.Monad ((<=<), when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Fix (MonadFix)
+import Control.Monad.Fix (MonadFix, mfix)
 import Control.Monad.Primitive (PrimMonad, PrimBase, PrimState, RealWorld, liftPrim)
 import Control.Monad.Reader (ReaderT, runReaderT, asks)
+import Control.Monad.ST (ST, runST)
 import Data.Set (Set)
 import Data.Foldable (traverse_)
 import Data.Functor.Classes (Eq1(..), Ord1(..))
@@ -177,9 +177,7 @@ memoFix ::
   (Eq a, Hashable a, PrimBase m, MonadFix m) =>
   ((a -> A m b) -> a -> A m b) ->
   A m (a -> A m b)
-memoFix f = do
-  rec f' <- memo (f f')
-  pure f'
+memoFix f = mfix (memo . f)
 
 newtype AVar m a = AVar { unAVar :: Ref m (AThunk m a) }
 instance Eq (AVar m a) where; AVar a == AVar b = a == b
