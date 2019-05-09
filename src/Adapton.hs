@@ -1,10 +1,12 @@
 {-# language GADTs, ScopedTypeVariables, RankNTypes #-}
 {-# language GeneralizedNewtypeDeriving #-}
 {-# language RoleAnnotations #-}
+{-# language RecursiveDo #-}
 module Adapton where
 
 import Control.Concurrent.Supply (Supply, newSupply, freshId)
 import Control.Monad ((<=<), when)
+import Control.Monad.Fix (MonadFix)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (ReaderT, runReaderT, asks)
 import Data.Set (Set)
@@ -53,7 +55,7 @@ instance Ord1 (AThunk s) where
   liftCompare _ a b = compare (_id a) (_id b)
 
 newtype A s a = A { unA :: ReaderT (Env s) IO a }
-  deriving (Functor, Applicative, Monad, MonadIO)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
 type role A nominal nominal
 
 fresh :: IORef Supply -> IO Int
@@ -146,12 +148,12 @@ force a = do
   liftIO $ writeIORef current prev
   result <$ traverse_ (\(SomeAThunk x) -> addDcgEdge x a) prev
 
-memoizeL ::
+memoL ::
   forall s a b.
   (Eq a, Hashable a) =>
   (a -> A s b) ->
   A s (a -> A s (AThunk s b))
-memoizeL f = do
+memoL f = do
   table :: BasicHashTable a (AThunk s b) <- liftIO HashTable.new
   s <- A $ asks _supply
   pure $ \x -> do
@@ -162,8 +164,13 @@ memoizeL f = do
         a <$ liftIO (HashTable.insert table x a)
       Just a -> pure a
 
-memoize :: forall s a b. (Eq a, Hashable a) => (a -> A s b) -> A s (a -> A s b)
-memoize f = (force <=<) <$> memoizeL f
+memo :: forall s a b. (Eq a, Hashable a) => (a -> A s b) -> A s (a -> A s b)
+memo f = (force <=<) <$> memoL f
+
+memoFix :: (Eq a, Hashable a) => ((a -> A s b) -> a -> A s b) -> A s (a -> A s b)
+memoFix f = do
+  rec f' <- memo (f f')
+  pure f'
 
 newtype AVar s a = AVar { unAVar :: Ref s (AThunk s a) }
 instance Eq (AVar s a) where; AVar a == AVar b = a == b
@@ -208,41 +215,42 @@ right :: Tree f a -> f (Tree f a)
 right (Bin _ a) = a
 right Tip{} = undefined
 
-maxTree :: Ord a => AVar s (Tree (AVar s) a) -> A s a
-maxTree a = do
-  a' <- avarGet a
-  case a' of
-    Tip x -> pure x
-    Bin x y -> max <$> maxTree x <*> maxTree y
-
-maxTreePath :: Ord a => AVar s (Tree (AVar s) a) -> A s [Bool]
-maxTreePath a = do
-  a' <- avarGet a
-  case a' of
-    Tip x -> pure []
-    Bin x y -> do
-      x' <- maxTree x
-      y' <- maxTree y
-      if x' > y'
-        then (False :) <$> maxTreePath x
-        else (True :) <$> maxTreePath y
-
 prog2 :: IO ()
-prog2 =
-  runA $ do
-    mtInt <- memoize maxTree
-    mtpInt <- memoize maxTreePath
+prog2 = runA go
+  where
+    go :: forall s. A s ()
+    go = do
+      maxTree :: AVar s (Tree (AVar s) Int) -> A s Int <-
+        memoFix $ \recur a -> do
+          a' <- avarGet a
+          liftIO . putStrLn $ "computing maxTree"
+          case a' of
+            Tip x -> pure x
+            Bin x y -> max <$> recur x <*> recur y
 
-    t1 <- avar $ Bin <$> avar (pure $ Tip (1::Int)) <*> avar (pure $ Tip 2)
-    t2 <- avar $ Bin <$> avar (pure $ Tip 3) <*> avar (pure $ Tip 4)
-    tree <- avar $ pure (Bin t1 t2)
+      maxTreePath :: AVar s (Tree (AVar s) Int) -> A s [Bool] <-
+        memoFix $ \recur a -> do
+          liftIO . putStrLn $ "computing maxTreePath"
+          a' <- avarGet a
+          case a' of
+            Tip x -> pure []
+            Bin x y -> do
+              x' <- maxTree x
+              y' <- maxTree y
+              if x' > y'
+                then (False :) <$> recur x
+                else (True :) <$> recur y
 
-    liftIO . print =<< mtInt tree
-    liftIO . print =<< mtpInt tree
+      t1 <- avar $ Bin <$> avar (pure $ Tip (1::Int)) <*> avar (pure $ Tip 2)
+      t2 <- avar $ Bin <$> avar (pure $ Tip 3) <*> avar (pure $ Tip 4)
+      tree <- avar $ pure (Bin t1 t2)
 
-    avarSet t2 $ pure (Tip 5)
-    liftIO . print =<< mtInt tree
-    liftIO . print =<< mtpInt tree
+      liftIO . print =<< maxTree tree
+      liftIO . print =<< maxTreePath tree
 
-    liftIO . print =<< mtInt =<< fmap right (avarGet tree)
-    liftIO . print =<< mtpInt =<< fmap right (avarGet tree)
+      avarSet t2 $ pure (Tip 5)
+      liftIO . print =<< maxTree tree
+      liftIO . print =<< maxTreePath tree
+
+      liftIO . print =<< maxTree =<< fmap right (avarGet tree)
+      liftIO . print =<< maxTreePath =<< fmap right (avarGet tree)
