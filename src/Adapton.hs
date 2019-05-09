@@ -1,44 +1,60 @@
-{-# language GADTs, RecursiveDo, ScopedTypeVariables, RankNTypes #-}
+{-# language GADTs, ScopedTypeVariables, RankNTypes #-}
+{-# language GeneralizedNewtypeDeriving #-}
+{-# language RoleAnnotations #-}
 module Adapton where
 
-import Control.Concurrent.Supply (Supply, freshId)
-import Control.Monad (when)
+import Control.Concurrent.Supply (Supply, newSupply, freshId)
+import Control.Monad ((<=<), when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Reader (ReaderT, runReaderT, asks)
 import Data.Set (Set)
 import Data.Foldable (traverse_)
 import Data.Functor.Classes (Eq1(..), Ord1(..))
-import Data.Hashable (Hashable, hash)
+import Data.Hashable (Hashable(..), hash)
 import Data.HashTable.IO (BasicHashTable)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef)
-
-import GHC.Exts (Any)
-import Unsafe.Coerce (unsafeCoerce)
 
 import qualified Data.HashTable.IO as HashTable
 import qualified Data.Set as Set
 
-data SomeAdapton where
-  SomeAdapton :: Adapton a -> SomeAdapton
-instance Eq SomeAdapton where
-  SomeAdapton a == SomeAdapton b = liftEq undefined a b
-instance Ord SomeAdapton where
-  compare (SomeAdapton a) (SomeAdapton b) = liftCompare undefined a b
+data SomeAThunk s where
+  SomeAThunk :: AThunk s a -> SomeAThunk s
+instance Eq (SomeAThunk s) where
+  SomeAThunk a == SomeAThunk b = liftEq undefined a b
+instance Ord (SomeAThunk s)  where
+  compare (SomeAThunk a) (SomeAThunk b) = liftCompare undefined a b
 
-data Adapton a
-  = Adapton
+data AThunk s a
+  = AThunk
   { _id :: Int
-  , _thunk :: IO a
+  , _thunk :: A s a
   , _result :: IORef a
-  , _sub :: IORef (Set SomeAdapton)
-  , _super :: IORef (Set SomeAdapton)
+  , _sub :: IORef (Set (SomeAThunk s))
+  , _super :: IORef (Set (SomeAThunk s))
   , _clean :: IORef Bool
   }
+type role AThunk nominal nominal
 
-instance Eq (Adapton a) where; a == b = _id a == _id b
-instance Eq1 Adapton where; liftEq _ a b = _id a == _id b
-instance Ord (Adapton a) where
+instance Hashable (AThunk s a) where
+  hash = _id
+  hashWithSalt a = hashWithSalt a . _id
+
+data Env s
+  = Env
+  { _supply :: IORef Supply
+  , _current :: IORef (Maybe (SomeAThunk s))
+  }
+
+instance Eq (AThunk s a) where; a == b = _id a == _id b
+instance Eq1 (AThunk s) where; liftEq _ a b = _id a == _id b
+instance Ord (AThunk s a) where
   compare a b = compare (_id a) (_id b)
-instance Ord1 Adapton where
+instance Ord1 (AThunk s) where
   liftCompare _ a b = compare (_id a) (_id b)
+
+newtype A s a = A { unA :: ReaderT (Env s) IO a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+type role A nominal nominal
 
 fresh :: IORef Supply -> IO Int
 fresh ref = do
@@ -46,15 +62,16 @@ fresh ref = do
   let (n, a') = freshId a
   n <$ writeIORef ref a'
 
-mkAdapton :: IORef Supply -> IO a -> IO (Adapton a)
-mkAdapton supplyRef a = do
-  n <- fresh supplyRef
-  resultRef <- newIORef undefined
-  subRef <- newIORef mempty
-  superRef <- newIORef mempty
-  cleanRef <- newIORef False
+mkAThunk :: A s a -> A s (AThunk s a)
+mkAThunk a = do
+  supplyRef <- A $ asks _supply
+  n <- A . liftIO $ fresh supplyRef
+  resultRef <- A . liftIO $ newIORef undefined
+  subRef <- A . liftIO $ newIORef mempty
+  superRef <- A . liftIO $ newIORef mempty
+  cleanRef <- A . liftIO $ newIORef False
   pure $
-    Adapton
+    AThunk
     { _id = n
     , _thunk = a
     , _result = resultRef
@@ -63,48 +80,51 @@ mkAdapton supplyRef a = do
     , _clean = cleanRef
     }
 
-addDcgEdge :: Adapton a -> Adapton b -> IO ()
+addDcgEdge :: AThunk s a -> AThunk s b -> A s ()
 addDcgEdge super sub = do
-  modifyIORef (_sub super) $ Set.insert (SomeAdapton sub)
-  modifyIORef (_super sub) $ Set.insert (SomeAdapton super)
+  liftIO . modifyIORef (_sub super) $ Set.insert (SomeAThunk sub)
+  liftIO . modifyIORef (_super sub) $ Set.insert (SomeAThunk super)
 
-delDcgEdge :: Adapton a -> Adapton b -> IO ()
+delDcgEdge :: AThunk s a -> AThunk s b -> A s ()
 delDcgEdge super sub = do
-  modifyIORef (_sub super) $ Set.delete (SomeAdapton sub)
-  modifyIORef (_super sub) $ Set.delete (SomeAdapton super)
+  liftIO . modifyIORef (_sub super) $ Set.delete (SomeAThunk sub)
+  liftIO . modifyIORef (_super sub) $ Set.delete (SomeAThunk super)
 
-compute :: Adapton a -> IO a
+compute :: AThunk s a -> A s a
 compute a = do
-  b <- readIORef (_clean a)
+  b <- liftIO $ readIORef (_clean a)
   if b
-    then readIORef (_result a)
+    then liftIO $ readIORef (_result a)
     else do
-      traverse_ (\(SomeAdapton b) -> delDcgEdge a b) =<< readIORef (_sub a)
-      writeIORef (_clean a) True
-      writeIORef (_result a) =<< _thunk a
+      traverse_ (\(SomeAThunk b) -> delDcgEdge a b) =<< liftIO (readIORef $ _sub a)
+      liftIO $ writeIORef (_clean a) True
+      liftIO . writeIORef (_result a) =<< _thunk a
       compute a
 
-dirty :: Adapton a -> IO ()
+dirty :: AThunk s a -> A s ()
 dirty a = do
-  b <- readIORef $ _clean a
+  b <- liftIO . readIORef $ _clean a
   when b $ do
-    writeIORef (_clean a) False
-    traverse_ (\(SomeAdapton x) -> dirty x) =<< readIORef (_super a)
+    liftIO $ writeIORef (_clean a) False
+    traverse_ (\(SomeAThunk x) -> dirty x) =<< liftIO (readIORef $ _super a)
 
-newtype Ref a = Ref { unRef :: Adapton a }
+newtype Ref s a = Ref { unRef :: AThunk s a }
+instance Eq (Ref s a) where; Ref a == Ref b = a == b
+instance Hashable (Ref s a) where; hash = hash . unRef; hashWithSalt a = hashWithSalt a . unRef
 
-ref :: IORef Supply -> a -> IO (Ref a)
-ref supplyRef val = do
-  n <- fresh supplyRef
-  resultRef <- newIORef val
-  subRef <- newIORef mempty
-  superRef <- newIORef mempty
-  cleanRef <- newIORef True
+ref :: a -> A s (Ref s a)
+ref val = do
+  supplyRef <- A $ asks _supply
+  n <- liftIO $ fresh supplyRef
+  resultRef <- liftIO $ newIORef val
+  subRef <- liftIO $ newIORef mempty
+  superRef <- liftIO $ newIORef mempty
+  cleanRef <- liftIO $ newIORef True
   let
     a =
-      Adapton
+      AThunk
       { _id = n
-      , _thunk = readIORef resultRef
+      , _thunk = liftIO $ readIORef resultRef
       , _result = resultRef
       , _sub = subRef
       , _super = superRef
@@ -112,69 +132,117 @@ ref supplyRef val = do
       }
   pure $ Ref a
 
-setRef :: Ref a -> a -> IO ()
+setRef :: Ref s a -> a -> A s ()
 setRef (Ref a) val = do
-  writeIORef (_result a) val
+  liftIO $ writeIORef (_result a) val
   dirty a
 
-force :: IORef (Maybe SomeAdapton) -> Adapton a -> IO a
-force current a = do
-  prev <- readIORef current
-  writeIORef current $ Just (SomeAdapton a)
+force :: AThunk s a -> A s a
+force a = do
+  current <- A $ asks _current
+  prev <- liftIO $ readIORef current
+  liftIO $ writeIORef current $ Just (SomeAThunk a)
   result <- compute a
-  writeIORef current prev
-  result <$ traverse_ (\(SomeAdapton x) -> addDcgEdge x a) prev
+  liftIO $ writeIORef current prev
+  result <$ traverse_ (\(SomeAThunk x) -> addDcgEdge x a) prev
 
-memoizeLM ::
-  forall a b.
-  Hashable a =>
-  BasicHashTable Int Any ->
-  IORef Supply ->
-  (a -> IO b) ->
-  a -> IO (Adapton b)
-memoizeLM table s f x = do
-  let h = hash x
-  res <- HashTable.lookup table h
-  case res of
-    Nothing -> do
-      a :: Adapton b <- mkAdapton s (f x)
-      a <$ HashTable.insert table h (unsafeCoerce a :: Any)
-    Just a -> pure (unsafeCoerce a :: Adapton b)
-
-mapAdapton ::
-  Hashable a =>
-  BasicHashTable Int Any ->
-  IORef Supply ->
-  IORef (Maybe SomeAdapton) ->
-  (a -> IO b) ->
-  Adapton a ->
-  IO (Adapton b)
-mapAdapton ht sup cur f a = force cur a >>= memoizeLM ht sup f
-
-memoizeM ::
+memoizeL ::
   forall s a b.
-  Hashable a =>
-  BasicHashTable Int Any ->
-  IORef Supply ->
-  IORef (Maybe SomeAdapton) ->
-  (a -> IO b) ->
-  a -> IO b
-memoizeM table s cur f x = force cur =<< memoizeLM table s f x
+  (Eq a, Hashable a) =>
+  (a -> A s b) ->
+  A s (a -> A s (AThunk s b))
+memoizeL f = do
+  table :: BasicHashTable a (AThunk s b) <- liftIO HashTable.new
+  s <- A $ asks _supply
+  pure $ \x -> do
+    res <- liftIO $ HashTable.lookup table x
+    case res of
+      Nothing -> do
+        a :: AThunk s b <- mkAThunk (f x)
+        a <$ liftIO (HashTable.insert table x a)
+      Just a -> pure a
 
-newtype AVar s a = AVar { unAVar :: Ref (Adapton a) }
+memoize :: forall s a b. (Eq a, Hashable a) => (a -> A s b) -> A s (a -> A s b)
+memoize f = (force <=<) <$> memoizeL f
 
-avar :: IORef Supply -> IO a -> IO (AVar s a)
-avar sup a = fmap AVar . ref sup =<< mkAdapton sup a
+newtype AVar s a = AVar { unAVar :: Ref s (AThunk s a) }
+instance Eq (AVar s a) where; AVar a == AVar b = a == b
+instance Hashable (AVar s a) where; hash = hash . unAVar; hashWithSalt a = hashWithSalt a . unAVar
 
-avarGet :: IORef (Maybe SomeAdapton) -> AVar s a -> IO a
-avarGet cur (AVar (Ref a)) = force cur =<< force cur a
+avar :: A s a -> A s (AVar s a)
+avar a = fmap AVar . ref =<< mkAThunk a
 
-avarSet :: IORef Supply -> AVar s a -> IO a -> IO ()
-avarSet sup (AVar v) a = setRef v =<< mkAdapton sup a
+avarGet :: AVar s a -> A s a
+avarGet (AVar (Ref a)) = force =<< force a
 
-setup :: Supply -> IO (IORef Supply, IORef (Maybe SomeAdapton), BasicHashTable Int Any)
+avarSet :: AVar s a -> A s a -> A s ()
+avarSet (AVar v) a = setRef v =<< mkAThunk a
+
+setup :: Supply -> IO (Env s)
 setup sup = do
   supRef <- newIORef sup
-  ht <- HashTable.new
   curRef <- newIORef Nothing
-  pure (supRef, curRef, ht)
+  pure $ Env supRef curRef
+
+runA :: (forall s. A s a) -> IO a
+runA a = do
+  sup <- newSupply
+  setup sup >>= runReaderT (unA a)
+
+
+prog1 :: IO ()
+prog1 =
+  runA $ do
+    v1 <- avar $ pure 2
+    v2 <- avar $ (+4) <$> avarGet v1
+    b <- avar $ (+) <$> avarGet v1 <*> avarGet v2
+    liftIO . print =<< avarGet b
+    avarSet v1 $ pure 10
+    liftIO . print =<< avarGet b
+
+data Tree f a
+  = Tip a
+  | Bin (f (Tree f a)) (f (Tree f a))
+
+right :: Tree f a -> f (Tree f a)
+right (Bin _ a) = a
+right Tip{} = undefined
+
+maxTree :: Ord a => AVar s (Tree (AVar s) a) -> A s a
+maxTree a = do
+  a' <- avarGet a
+  case a' of
+    Tip x -> pure x
+    Bin x y -> max <$> maxTree x <*> maxTree y
+
+maxTreePath :: Ord a => AVar s (Tree (AVar s) a) -> A s [Bool]
+maxTreePath a = do
+  a' <- avarGet a
+  case a' of
+    Tip x -> pure []
+    Bin x y -> do
+      x' <- maxTree x
+      y' <- maxTree y
+      if x' > y'
+        then (False :) <$> maxTreePath x
+        else (True :) <$> maxTreePath y
+
+prog2 :: IO ()
+prog2 =
+  runA $ do
+    mtInt <- memoize maxTree
+    mtpInt <- memoize maxTreePath
+
+    t1 <- avar $ Bin <$> avar (pure $ Tip (1::Int)) <*> avar (pure $ Tip 2)
+    t2 <- avar $ Bin <$> avar (pure $ Tip 3) <*> avar (pure $ Tip 4)
+    tree <- avar $ pure (Bin t1 t2)
+
+    liftIO . print =<< mtInt tree
+    liftIO . print =<< mtpInt tree
+
+    avarSet t2 $ pure (Tip 5)
+    liftIO . print =<< mtInt tree
+    liftIO . print =<< mtpInt tree
+
+    liftIO . print =<< mtInt =<< fmap right (avarGet tree)
+    liftIO . print =<< mtpInt =<< fmap right (avarGet tree)
