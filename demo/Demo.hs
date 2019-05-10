@@ -9,11 +9,11 @@ prog1 :: IO ()
 prog1 =
   runAIO $ do
     v1 <- avar $ pure 2
-    v2 <- avar $ (+4) <$> avarGet v1
-    b <- avar $ (+) <$> avarGet v1 <*> avarGet v2
-    liftPrim . print =<< avarGet b
-    avarSet v1 $ pure 10
-    liftPrim . print =<< avarGet b
+    v2 <- avar $ (+4) <$> getAVar v1
+    b <- avar $ (+) <$> getAVar v1 <*> getAVar v2
+    liftPrim . print =<< getAVar b
+    setAVar v1 $ pure 10
+    liftPrim . print =<< getAVar b
 
 data Tree f a
   = Tip a
@@ -30,7 +30,7 @@ prog2 = runAIO go
     go = do
       maxTree :: AVar IO (Tree (AVar IO) Int) -> A IO Int <-
         memoFix $ \recur a -> do
-          a' <- avarGet a
+          a' <- getAVar a
           liftPrim . putStrLn $ "computing maxTree"
           case a' of
             Tip x -> pure x
@@ -39,7 +39,7 @@ prog2 = runAIO go
       maxTreePath :: AVar IO (Tree (AVar IO) Int) -> A IO [Bool] <-
         memoFix $ \recur a -> do
           liftPrim . putStrLn $ "computing maxTreePath"
-          a' <- avarGet a
+          a' <- getAVar a
           case a' of
             Tip x -> pure []
             Bin x y -> do
@@ -57,18 +57,18 @@ prog2 = runAIO go
       liftPrim . print =<< maxTree tree
       liftPrim . print =<< maxTreePath tree
 
-      avarSet t2 $ pure (Tip 5)
+      setAVar t2 $ pure (Tip 5)
       liftPrim . print =<< maxTree tree
       liftPrim . print =<< maxTreePath tree
 
-      liftPrim . print =<< maxTree =<< fmap right (avarGet tree)
-      liftPrim . print =<< maxTreePath =<< fmap right (avarGet tree)
+      liftPrim . print =<< maxTree =<< fmap right (getAVar tree)
+      liftPrim . print =<< maxTreePath =<< fmap right (getAVar tree)
 
-      avarSet t2 $ Bin <$> avar (pure $ Tip 20) <*> avar (Tip . (3*) <$> avarGet lucky)
+      setAVar t2 $ Bin <$> avar (pure $ Tip 20) <*> avar (Tip . (3*) <$> getAVar lucky)
       liftPrim . print =<< maxTree tree
       liftPrim . print =<< maxTreePath tree
 
-      avarSet lucky $ pure 3
+      setAVar lucky $ pure 3
       liftPrim . print =<< maxTree tree
       liftPrim . print =<< maxTreePath tree
 

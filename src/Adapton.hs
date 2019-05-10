@@ -3,13 +3,15 @@
 {-# language DataKinds, PolyKinds, UnboxedTuples, UndecidableInstances #-}
 {-# language TypeApplications #-}
 module Adapton
-  ( runA, runAIO
+  ( A, runA, runAIO
     -- * Thunks
   , Thunk, thunk, force
     -- * Refs
   , Ref, ref, getRef, setRef
     -- * AVars
   , AVar, avar, getAVar, setAVar
+    -- * Memoization
+  , memo, memoFix
   )
 where
 
